@@ -123,17 +123,21 @@ class SSDInceptionV2FeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
     def si_cnn(self, preprocessed_inputs):
         batch_size = preprocessed_inputs.get_shape()[0]
         image_size = preprocessed_inputs.get_shape()[1]
+        orig_image_num_channels = preprocessed_inputs.get_shape()[3]
+
         scale = tf.ones([batch_size])
 
         single_bb = tf.multiply(tf.constant([0, 0, 1, 1]), (image_size - 1))
+
         single_bb_expanded = tf.expand_dims(single_bb, axis=0)
+
         square_bb = tf.tile(single_bb_expanded, [batch_size, 1])
 
         single_bl_bb = tf.multiply(tf.constant([0, 0, 1, 1]), (image_size - 1))
         single_bl_bb_expanded = tf.expand_dims(single_bl_bb, axis=0)
         blackout_bb = tf.cast(tf.tile(single_bl_bb_expanded, [batch_size, 1]), tf.float32)
 
-        num_channels = 3
+        num_channels = 4
         # conv1
         with tf.name_scope('conv1') as scope:
             kernel = tf.Variable(tf.truncated_normal([11, 11, 3, num_channels], dtype=tf.float32,
@@ -190,12 +194,22 @@ class SSDInceptionV2FeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
 
             square_bounding_boxes = tf.concat([y1s, x1s, y2s, x2s], axis=1)
             square_bounding_boxes = square_bounding_boxes + tf.cast(curr_size, tf.float32) / 2 * factor
-            # padding so that bounding boxes remain within the limits
 
+            # padding so that bounding boxes remain within the limits
             padding_temp = curr_size / 2 * factor
+
             pad_tensor = [[0, 0], [padding_temp, padding_temp], [padding_temp, padding_temp], [0, 0]]
 
-            padded_images = tf.pad(conv1, pad_tensor, "CONSTANT")
+            # below is the original statement with conv1 as the input
+            # we are changing conv1 to preprocessed_inputs, so that we apply bounding boxes on the
+            # original image so that original image is passed to the next layer.
+            # padded_images = tf.pad(conv1, pad_tensor, "CONSTANT")
+
+            conv1 = tf.Print(conv1, [tf.shape(conv1)],
+                                     message="@@@@@@@@@@@@@@@@@@@@@@@@@@conv1",
+                                     summarize=100)
+            padded_images = tf.pad(preprocessed_inputs, pad_tensor, "CONSTANT")
+
 
             # Crop images to bounding boxes, and zoom to current size
             cropped_images = tf.image.crop_and_resize(padded_images, square_bounding_boxes, tf.range(batch_size),
@@ -231,31 +245,31 @@ class SSDInceptionV2FeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
             masks = tf.matmul(x_masks, y_masks)
             blackout_images = tf.multiply(cropped_images, tf.expand_dims(masks, axis=-1))
 
+
             new_scale = scale * curr_size_float_by_2 / (factor * max_sds)
 
-            #new_square_bb = tf.zeros([batch_size, 4])
-            #new_square_bb[:, 1]
+            # new_square_bb = tf.zeros([batch_size, 4])
+            # new_square_bb[:, 1]
 
             new_square_bb_1 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 1] / scale
             new_square_bb_0 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 0] / scale
             new_square_bb_3 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 3] / scale
             new_square_bb_2 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 2] / scale
 
-            new_square_bb = tf.stack([new_square_bb_0,new_square_bb_1,new_square_bb_2,new_square_bb_3], axis=1)
+            new_square_bb = tf.stack([new_square_bb_0, new_square_bb_1, new_square_bb_2, new_square_bb_3], axis=1)
 
             scale = new_scale
             square_bb = new_square_bb
 
-
             blackout_images_resized = tf.image.resize_images(blackout_images, [image_size, image_size])
 
+            # preprocessing to normalize pixel values
             blackout_images_processed = self.preprocess(blackout_images_resized)
 
+            # for fixing the shape of tensor as expected in next step in the pipeline
             # Find better way to do the following logic
-            blackout_images_resized_sliced = tf.slice(blackout_images_resized,[0, 0, 0, 0],[-1,-1,-1,num_channels])
-
-            print(blackout_images_resized_sliced)
-            print(preprocessed_inputs)
+            blackout_images_resized_sliced = tf.slice(blackout_images_processed, [0, 0, 0, 0],
+                                                      [-1, -1, -1, orig_image_num_channels])
 
 
         return blackout_images_resized_sliced
