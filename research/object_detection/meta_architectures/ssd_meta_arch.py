@@ -278,6 +278,160 @@ class SSDMetaArch(model.DetectionModel):
     }
     return predictions_dict
 
+  def si_cnn(self, preprocessed_inputs):
+    batch_size = preprocessed_inputs.get_shape()[0]
+    image_size = preprocessed_inputs.get_shape()[1]
+    orig_image_num_channels = preprocessed_inputs.get_shape()[3]
+
+    scale = tf.ones([batch_size])
+
+    single_bb = tf.multiply(tf.constant([0, 0, 1, 1]), (image_size - 1))
+
+    single_bb_expanded = tf.expand_dims(single_bb, axis=0)
+
+    square_bb = tf.tile(single_bb_expanded, [batch_size, 1])
+
+    single_bl_bb = tf.multiply(tf.constant([0, 0, 1, 1]), (image_size - 1))
+    single_bl_bb_expanded = tf.expand_dims(single_bl_bb, axis=0)
+    blackout_bb = tf.cast(tf.tile(single_bl_bb_expanded, [batch_size, 1]), tf.float32)
+
+    num_channels = 4
+    # conv1
+    with tf.name_scope('conv1') as scope:
+      kernel = tf.Variable(tf.truncated_normal([11, 11, 3, num_channels], dtype=tf.float32,
+                           stddev=1e-1), name='weights')
+      conv = tf.nn.conv2d(preprocessed_inputs, kernel, [1, 4, 4, 1], padding='SAME')
+      biases = tf.Variable(tf.constant(0.0, shape=[num_channels], dtype=tf.float32),
+                 trainable=True, name='biases')
+      bias = tf.nn.bias_add(conv, biases)
+      conv1 = tf.nn.relu(bias, name=scope)
+
+    # zooming1
+    with tf.name_scope('zoom1') as scope:
+      fmap_weights = tf.Variable(tf.truncated_normal([num_channels], dtype=tf.float32,
+                              stddev=1e-1), name='fmap_weights')
+      summed_images = tf.reduce_sum(tf.multiply(conv1, fmap_weights), axis=-1)
+      summed_rows = tf.reduce_sum(summed_images, axis=1)
+      summed_cols = tf.reduce_sum(summed_images, axis=2)
+      curr_size = tf.shape(summed_rows)[-1]
+      linspace = tf.cast(tf.range(0, summed_rows.get_shape().as_list()[-1], 1), tf.float32)
+
+      x_means = tf.reduce_sum(tf.multiply(summed_rows, linspace)) / tf.reduce_sum(summed_rows)
+      y_means = tf.reduce_sum(tf.multiply(summed_cols, linspace)) / tf.reduce_sum(summed_cols)
+      x_vars = tf.reduce_sum(tf.multiply(tf.square(linspace - x_means), summed_rows)) / tf.reduce_sum(summed_rows)
+      y_vars = tf.reduce_sum(tf.multiply(tf.square(linspace - y_means), summed_cols)) / tf.reduce_sum(summed_cols)
+      x_sds = tf.sqrt(x_vars)
+      y_sds = tf.sqrt(y_vars)
+      factor = 5
+      # If proposed bounding box cuts into blackout region, reduce its size
+      x_shift = (x_means + factor * x_sds) - tf.minimum(x_means + factor * x_sds, blackout_bb[:, 3])
+      x_means -= x_shift / 2
+      x_sds -= x_shift / (2 * factor)
+      x_shift = tf.maximum(x_means - factor * x_sds, blackout_bb[:, 1]) - (x_means - factor * x_sds)
+      x_means += x_shift / 2
+      x_sds -= x_shift / (2 * factor)
+
+      y_shift = (y_means + factor * y_sds) - tf.minimum(y_means + factor * y_sds, blackout_bb[:, 3])
+      y_means -= y_shift / 2
+      y_sds -= y_shift / (2 * factor)
+      y_shift = tf.maximum(y_means - factor * y_sds, blackout_bb[:, 1]) - (y_means - factor * y_sds)
+      y_means += y_shift / 2
+      y_sds -= y_shift / (2 * factor)
+
+      # Slicing
+      max_sds = tf.maximum(x_sds, y_sds)
+      y1s = y_means - factor * max_sds
+      y2s = y_means + factor * max_sds
+      x1s = x_means - factor * max_sds
+      x2s = x_means + factor * max_sds
+
+      y1s = tf.expand_dims(y1s, axis=1)
+      y2s = tf.expand_dims(y2s, axis=1)
+      x1s = tf.expand_dims(x1s, axis=1)
+      x2s = tf.expand_dims(x2s, axis=1)
+
+      square_bounding_boxes = tf.concat([y1s, x1s, y2s, x2s], axis=1)
+      square_bounding_boxes = square_bounding_boxes + tf.cast(curr_size, tf.float32) / 2 * factor
+
+      # padding so that bounding boxes remain within the limits
+      padding_temp = curr_size / 2 * factor
+
+      pad_tensor = [[0, 0], [padding_temp, padding_temp], [padding_temp, padding_temp], [0, 0]]
+
+      # below is the original statement with conv1 as the input
+      # we are changing conv1 to preprocessed_inputs, so that we apply bounding boxes on the
+      # original image so that original image is passed to the next layer.
+      # padded_images = tf.pad(conv1, pad_tensor, "CONSTANT")
+
+      conv1 = tf.Print(conv1, [tf.shape(conv1)],
+                   message="@@@@@@@@@@@@@@@@@@@@@@@@@@conv1",
+                   summarize=100)
+      padded_images = tf.pad(preprocessed_inputs, pad_tensor, "CONSTANT")
+
+
+      # Crop images to bounding boxes, and zoom to current size
+      cropped_images = tf.image.crop_and_resize(padded_images, square_bounding_boxes, tf.range(batch_size),
+                           [curr_size, curr_size])
+
+      # Blackout part of image corresponding to original bounding boxes (rather than the current square bounding boxes)
+      # For the zoomed image, new center is just the exact center. Padding needed in original scale is (factor*x_sds).
+      # Padding needed in new scale is (factor*x_sds) * [(curr_size/2) / (factor*max_sds)]
+
+      curr_size_float_by_2 = tf.cast(curr_size, tf.float32) / 2
+
+      # x_means = curr_size_float_by_2
+      # y_means = curr_size_float_by_2
+
+      # Actually like the following line but factor will cancel out
+      # x2s = x_means + factor * x_sds * (curr_size / 2) / (factor * max_sds)
+
+      x2s = (1.0 + x_sds / max_sds) * curr_size_float_by_2
+      x1s = (1.0 - x_sds / max_sds) * curr_size_float_by_2
+      y2s = (1.0 + y_sds / max_sds) * curr_size_float_by_2
+      y1s = (1.0 - y_sds / max_sds) * curr_size_float_by_2
+
+      blackout_bb = tf.stack([y1s, x1s, y2s, x2s], axis=1)
+
+      x_masks = tf.cast(tf.logical_xor(tf.sequence_mask(x2s, curr_size), tf.sequence_mask(x1s, curr_size)),
+               tf.float32)
+      y_masks = tf.cast(tf.logical_xor(tf.sequence_mask(y2s, curr_size), tf.sequence_mask(y1s, curr_size)),
+               tf.float32)
+
+      y_masks = tf.expand_dims(y_masks, axis=1)
+      x_masks = tf.expand_dims(x_masks, axis=2)
+
+      masks = tf.matmul(x_masks, y_masks)
+      blackout_images = tf.multiply(cropped_images, tf.expand_dims(masks, axis=-1))
+
+
+      new_scale = scale * curr_size_float_by_2 / (factor * max_sds)
+
+      # new_square_bb = tf.zeros([batch_size, 4])
+      # new_square_bb[:, 1]
+
+      new_square_bb_1 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 1] / scale
+      new_square_bb_0 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 0] / scale
+      new_square_bb_3 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 3] / scale
+      new_square_bb_2 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 2] / scale
+
+      new_square_bb = tf.stack([new_square_bb_0, new_square_bb_1, new_square_bb_2, new_square_bb_3], axis=1)
+
+      scale = new_scale
+      square_bb = new_square_bb
+
+      blackout_images_resized = tf.image.resize_images(blackout_images, [image_size, image_size])
+
+      # preprocessing to normalize pixel values
+      blackout_images_processed = self.preprocess(blackout_images_resized)
+
+      # for fixing the shape of tensor as expected in next step in the pipeline
+      # Find better way to do the following logic
+      blackout_images_resized_sliced = tf.slice(blackout_images_processed, [0, 0, 0, 0],
+                           [-1, -1, -1, orig_image_num_channels])
+
+
+    return blackout_images_resized_sliced
+
   def _add_box_predictions_to_feature_maps(self, feature_maps):
     """Adds box predictors to each feature map and returns concatenated results.
 

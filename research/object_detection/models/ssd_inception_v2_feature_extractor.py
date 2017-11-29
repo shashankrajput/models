@@ -105,20 +105,8 @@ class SSDInceptionV2FeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
                                        reuse=self._reuse_weights) as scope:
                     zoomed_inputs = self.si_cnn(preprocessed_inputs)
 
-                    _, image_features = inception_v2.inception_v2_base(
-                        ops.pad_to_multiple(zoomed_inputs, self._pad_to_multiple),
-                        final_endpoint='Mixed_5c',
-                        min_depth=self._min_depth,
-                        depth_multiplier=self._depth_multiplier,
-                        scope=scope)
-                    feature_maps = feature_map_generators.multi_resolution_feature_maps(
-                        feature_map_layout=feature_map_layout,
-                        depth_multiplier=self._depth_multiplier,
-                        min_depth=self._min_depth,
-                        insert_1x1_conv=True,
-                        image_features=image_features)
 
-        return feature_maps.values()
+        return [zoomed_inputs]
 
     def si_cnn(self, preprocessed_inputs):
         batch_size = preprocessed_inputs.get_shape()[0]
