@@ -285,41 +285,64 @@ class SSDMetaArch(model.DetectionModel):
         with tf.name_scope('conv1') as scope:
             kernel = tf.Variable(tf.truncated_normal([11, 11, 3, num_channels], dtype=tf.float32,
                                                      stddev=1e-1), name='weights')
-            conv = tf.nn.conv2d(preprocessed_inputs, kernel, [1, 4, 4, 1], padding='SAME')
+            stride = 4
+            conv = tf.nn.conv2d(preprocessed_inputs, kernel, [1, stride, stride, 1], padding='SAME')
             biases = tf.Variable(tf.constant(0.0, shape=[num_channels], dtype=tf.float32),
                                  trainable=True, name='biases')
             bias = tf.nn.bias_add(conv, biases)
             conv1 = tf.nn.relu(bias, name=scope)
+            conv1 = tf.Print(conv1, [conv1], "conv1", summarize=100)
+            conv1 = tf.Print(conv1, [tf.shape(conv1)], "shape", summarize=100)
+            scale /= stride
+
 
         # zooming1
         with tf.name_scope('zoom1') as scope:
             fmap_weights = tf.Variable(tf.truncated_normal([num_channels], dtype=tf.float32,
                                                            stddev=1e-1), name='fmap_weights')
-            summed_images = tf.reduce_sum(tf.multiply(conv1, fmap_weights), axis=-1)
+            normalized_fmap_weights = tf.nn.softmax(fmap_weights)
+            summed_images = tf.reduce_sum(tf.multiply(conv1, normalized_fmap_weights), axis=-1)
             summed_rows = tf.reduce_sum(summed_images, axis=1)
+            # To ensure that this is not == 0
+            summed_rows += 0.1
             summed_cols = tf.reduce_sum(summed_images, axis=2)
+            # To ensure that this is not == 0
+            summed_cols += 0.1
             curr_size = tf.shape(summed_rows)[-1]
             linspace = tf.cast(tf.range(0, summed_rows.get_shape().as_list()[-1], 1), tf.float32)
 
-            x_means = tf.reduce_sum(tf.multiply(summed_rows, linspace)) / tf.reduce_sum(summed_rows)
-            y_means = tf.reduce_sum(tf.multiply(summed_cols, linspace)) / tf.reduce_sum(summed_cols)
-            x_vars = tf.reduce_sum(tf.multiply(tf.square(linspace - x_means), summed_rows)) / tf.reduce_sum(summed_rows)
-            y_vars = tf.reduce_sum(tf.multiply(tf.square(linspace - y_means), summed_cols)) / tf.reduce_sum(summed_cols)
+            debug_xsum = tf.reduce_sum(summed_rows, axis=1)
+            # debug_xsum = tf.Print(debug_xsum, [debug_xsum], "debug xsum")
+            x_means = tf.reduce_sum(tf.multiply(summed_rows, linspace), axis=1) / debug_xsum
+            debug_ysum = tf.reduce_sum(summed_cols, axis=1)
+            # debug_ysum = tf.Print(debug_ysum, [debug_ysum], "debug ysum")
+            y_means = tf.reduce_sum(tf.multiply(summed_cols, linspace), axis=1) / debug_ysum
+            x_means = tf.Print(x_means, [x_means], "x means")
+            y_means = tf.Print(y_means, [y_means], "y means")
+            linspace_matrix = tf.expand_dims(linspace, axis=0)
+            linspace_matrix = tf.tile(linspace_matrix, [batch_size, 1])
+            x_vars = tf.reduce_sum(tf.multiply(summed_rows, tf.square(linspace_matrix - tf.expand_dims(x_means, axis=-1))), axis=1) / tf.reduce_sum(summed_rows, axis=1)
+            y_vars = tf.reduce_sum(tf.multiply(summed_cols, tf.square(linspace_matrix - tf.expand_dims(y_means, axis=-1))), axis=1) / tf.reduce_sum(summed_cols, axis=1)
             x_sds = tf.sqrt(x_vars)
             y_sds = tf.sqrt(y_vars)
-            factor = 5
+            factor = tf.Variable(tf.constant(0.1), name='factor')
+            factor = tf.Print(factor, [factor], "factor:")
             # If proposed bounding box cuts into blackout region, reduce its size
             x_shift = (x_means + factor * x_sds) - tf.minimum(x_means + factor * x_sds, blackout_bb[:, 3])
+            # Shift x more than needed, so that gradient w.r.t factor doesn't vanish for factor exceeding boundary
+            x_shift *= (tf.exp(factor)+1) / (tf.exp(factor))
             x_means -= x_shift / 2
             x_sds -= x_shift / (2 * factor)
             x_shift = tf.maximum(x_means - factor * x_sds, blackout_bb[:, 1]) - (x_means - factor * x_sds)
             x_means += x_shift / 2
             x_sds -= x_shift / (2 * factor)
 
-            y_shift = (y_means + factor * y_sds) - tf.minimum(y_means + factor * y_sds, blackout_bb[:, 3])
+            y_shift = (y_means + factor * y_sds) - tf.minimum(y_means + factor * y_sds, blackout_bb[:, 2])
+            # Shift y more than needed, so that gradient w.r.t factor doesn't vanish for factor exceeding boundary
+            y_shift *= (tf.exp(factor)+1) / (tf.exp(factor))
             y_means -= y_shift / 2
             y_sds -= y_shift / (2 * factor)
-            y_shift = tf.maximum(y_means - factor * y_sds, blackout_bb[:, 1]) - (y_means - factor * y_sds)
+            y_shift = tf.maximum(y_means - factor * y_sds, blackout_bb[:, 0]) - (y_means - factor * y_sds)
             y_means += y_shift / 2
             y_sds -= y_shift / (2 * factor)
 
@@ -336,10 +359,11 @@ class SSDMetaArch(model.DetectionModel):
             x2s = tf.expand_dims(x2s, axis=1)
 
             square_bounding_boxes = tf.concat([y1s, x1s, y2s, x2s], axis=1)
-            square_bounding_boxes = square_bounding_boxes + tf.cast(curr_size, tf.float32) / 2 * factor
+            padding_width = tf.cast(curr_size, tf.float32) / 2 * factor
+            square_bounding_boxes = square_bounding_boxes + padding_width
 
             # padding so that bounding boxes remain within the limits
-            padding_temp = curr_size / 2 * factor
+            padding_temp = tf.cast(tf.cast(curr_size, tf.float32) / 2 * factor, tf.int32)
 
             pad_tensor = [[0, 0], [padding_temp, padding_temp], [padding_temp, padding_temp], [0, 0]]
 
@@ -373,6 +397,11 @@ class SSDMetaArch(model.DetectionModel):
             x1s = (1.0 - x_sds / max_sds) * curr_size_float_by_2
             y2s = (1.0 + y_sds / max_sds) * curr_size_float_by_2
             y1s = (1.0 - y_sds / max_sds) * curr_size_float_by_2
+            # x2s = tf.Print(x2s, [x2s])
+            # x1s = tf.Print(x1s, [x1s])
+            # y2s = tf.Print(y2s, [y2s])
+            # y1s = tf.Print(y1s, [y1s])
+            # max_sds = tf.Print(max_sds, [max_sds])
 
             blackout_bb = tf.stack([y1s, x1s, y2s, x2s], axis=1)
 
@@ -388,14 +417,18 @@ class SSDMetaArch(model.DetectionModel):
             blackout_images = tf.multiply(cropped_images, tf.expand_dims(masks, axis=-1))
 
             new_scale = scale * curr_size_float_by_2 / (factor * max_sds)
+            scale = tf.Print(scale, [scale], "scale:")
+            image_size = tf.Print(image_size, [image_size], "image_size:")
 
-            # new_square_bb = tf.zeros([batch_size, 4])
-            # new_square_bb[:, 1]
+            x1new = tf.maximum(square_bounding_boxes[:, 1] - padding_width, 0.0)
+            x2new = tf.minimum(square_bounding_boxes[:, 3] - padding_width, tf.cast(curr_size, tf.float32)-1.0)
+            y1new = tf.maximum(square_bounding_boxes[:, 0] - padding_width, 0.0)
+            y2new = tf.minimum(square_bounding_boxes[:, 2] - padding_width, tf.cast(curr_size, tf.float32)-1.0)
 
-            new_square_bb_1 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 1] / scale
-            new_square_bb_0 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 0] / scale
-            new_square_bb_3 = tf.cast(square_bb[:, 1], tf.float32) + square_bounding_boxes[:, 3] / scale
-            new_square_bb_2 = tf.cast(square_bb[:, 0], tf.float32) + square_bounding_boxes[:, 2] / scale
+            new_square_bb_1 = tf.cast(square_bb[:, 1], tf.float32) + x1new / scale
+            new_square_bb_0 = tf.cast(square_bb[:, 0], tf.float32) + y1new / scale
+            new_square_bb_3 = tf.cast(square_bb[:, 1], tf.float32) + x2new / scale
+            new_square_bb_2 = tf.cast(square_bb[:, 0], tf.float32) + y2new / scale
 
             new_square_bb = tf.stack([new_square_bb_0, new_square_bb_1, new_square_bb_2, new_square_bb_3], axis=1)
 
@@ -412,6 +445,8 @@ class SSDMetaArch(model.DetectionModel):
             blackout_images_resized_sliced = tf.slice(blackout_images_processed, [0, 0, 0, 0],
                                                       [-1, -1, -1, orig_image_num_channels])
 
+        square_bb /= tf.cast(image_size, tf.float32)
+        square_bb = tf.Print(square_bb, [square_bb], "squaer_bb", summarize=100)
         return blackout_images_resized_sliced, square_bb  # TODO: Is blackout_bb the correct bounding box in the original image (no, calculate rectangular bb using
 
         # both blackout_Bb and square_bb
